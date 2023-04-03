@@ -6,7 +6,7 @@ ti.init(arch=ti.cpu)
 res = (512, 512)
 pixels = ti.Vector.field(3, ti.f32, shape=res)
 force_radius = 256
-f_strength = 10000.0
+f_strength = 20000.0
 decay = 1 - 1 / 120
 
 grid = (512, 512)
@@ -20,13 +20,14 @@ force = ti.Vector.field(2, ti.f32, shape=grid)
 pressure = ti.field(ti.f32, shape=grid)
 
 # tracer
-n_tracer = 200000
-tracer = ti.Vector.field(2, ti.f32, shape=n_tracer)
+n_tracer = 100000
+tracer1 = ti.Vector.field(2, ti.f32, shape=n_tracer)
+tracer2 = ti.Vector.field(2, ti.f32, shape=n_tracer)
 
 last_curser = ti.Vector.field(2, ti.f32, ())
 curser = ti.Vector.field(2, ti.f32, ())
 picking = ti.field(ti.i32, ())
-
+display = 0
 
 # solver
 @ti.kernel
@@ -76,8 +77,8 @@ solver.factorize(L)
 @ti.kernel
 def init():
     for i in range(n_tracer):
-       tracer[i] = [ti.random(dtype=ti.f32) * 512, ti.random(dtype=ti.f32) * 512]
-
+        tracer1[i] = [ti.random(dtype=ti.f32) * 256 + 256, ti.random(dtype=ti.f32) * 512]
+        tracer2[i] = [ti.random(dtype=ti.f32) * 256, ti.random(dtype=ti.f32) * 512]
 
 
 @ti.kernel
@@ -143,10 +144,14 @@ def project(t: ti.f32):
 @ti.kernel
 def updateTracers(t: ti.f32):
     for i in range(n_tracer):
-        x = t * sample_bilinear(Vx, tracer[i])
-        y = t * sample_bilinear(Vy, tracer[i])
-        tracer[i] = [tracer[i][0] + x, tracer[i][1] + y]
-        tracer[i] = retile_point(tracer[i])
+        x = t * sample_bilinear(Vx, tracer1[i])
+        y = t * sample_bilinear(Vy, tracer1[i])
+        tracer1[i] = [tracer1[i][0] + x, tracer1[i][1] + y]
+        tracer1[i] = retile_point(tracer1[i])
+        x = t * sample_bilinear(Vx, tracer2[i])
+        y = t * sample_bilinear(Vy, tracer2[i])
+        tracer2[i] = [tracer2[i][0] + x, tracer2[i][1] + y]
+        tracer2[i] = retile_point(tracer2[i])
 
 
 def update(t: ti.f32):
@@ -158,7 +163,7 @@ def update(t: ti.f32):
     project(t)
 
     clear_force()
-    #updateTracers(t)
+    updateTracers(t)
 
 @ti.kernel
 def divergence():
@@ -170,7 +175,7 @@ def divergence():
         V_divs[i, j] = (Vx[vr[0], vr[1]] -
                         Vx[vl[0], vl[1]] +
                         Vy[vt[0], vt[1]] -
-                        Vy[vb[0], vb[1]]) * 0.5
+                        Vy[vb[0], vb[1]]) * 0.5 * 2
 @ti.func
 def backtrace(i, j, dt):
     # RK1
@@ -184,8 +189,8 @@ def backtrace(i, j, dt):
 def semi_lagrangian(x, new_x, dt, i, j):
     #new_x[i, j] = sample_bilinear(x, retile_point(backtrace(i, j, dt)))
     point = retile_point(backtrace(i, j, dt))
-    new_x[i, j] = x[ti.cast(point[0], ti.i32),
-                    ti.cast(point[1], ti.i32)]
+    #new_x[i, j] = x[ti.cast(point[0], ti.i32), ti.cast(point[1], ti.i32)]
+    new_x[i, j] = sample_bilinear(x, point)
 
 
 @ti.func
@@ -207,16 +212,24 @@ def retile_point(p):
 
 
 @ti.func
-def sample_bilinear(x, p):
-    mid_point = ti.cast(p + ti.Vector([0.5, 0.5]), ti.i32)
-    g = p - ti.Vector([0.5, 0.5]) - ti.floor(p - ti.Vector([0.5, 0.5]))
-    small_point = retile_point(mid_point - ti.Vector([0.5, 0.5]))
-    I = pos2Index(small_point)
-    f = 1 - g
+def lerp(vl, vr, frac):
+    # frac: [0.0, 1.0]
+    return vl + frac * (vr - vl)
 
-    return x[I] * (g[0] * g[1]) + x[retile_point(I + ti.Vector([1, 0]))] * (
-            f[0] * g[1]) + x[retile_point(I + ti.Vector([0, 1]))] * (
-            g[0] * f[1]) + x[retile_point(I + ti.Vector([1, 1]))] * (f[0] * f[1])
+@ti.func
+def sample_bilinear(x, p):
+    u, v = p
+    s, t = u - 0.5, v - 0.5
+    # floor
+    iu, iv = ti.cast(ti.floor(s), ti.i32), ti.cast(ti.floor(t), ti.i32)
+    # fract
+    fu, fv = s - iu, t - iv
+    a = x[retile_point([iu, iv])]
+    b = x[retile_point([iu + 1, iv])]
+    c = x[retile_point([iu, iv + 1])]
+    d = x[retile_point([iu + 1, iv + 1])]
+    return lerp(lerp(a, b, fu), lerp(c, d, fu), fv)
+
 
 @ti.kernel
 def copy_divergence(div_in: ti.template(), div_out: ti.types.ndarray()):
@@ -245,6 +258,11 @@ if __name__ == "__main__":
         for e in gui.get_events(ti.GUI.PRESS):
             if e.key in [ti.GUI.ESCAPE, ti.GUI.EXIT]:
                 exit()
+            if e.key == '1':
+                if display == 0:
+                    display = 1
+                else:
+                    display = 0
 
         if gui.is_pressed(ti.GUI.LMB):
             curser[None][0] = gui.get_cursor_pos()[0] * res[0]
@@ -259,10 +277,12 @@ if __name__ == "__main__":
         else:
             last_curser[None][0] = -1
 
-        for r in range(5):
+        for r in range(2):
             update(dt)
-
-        #gui.circles(tracer.to_numpy() / 512, radius=1, color=0x00FF00)
-        render()
-        gui.set_image(pixels)
+        if display == 0:
+            gui.circles(tracer1.to_numpy() / 512, radius=1, color=0xFFFFFF)
+            gui.circles(tracer2.to_numpy() / 512, radius=1, color=0xFF7F00)
+        else:
+            render()
+            gui.set_image(pixels)
         gui.show()
